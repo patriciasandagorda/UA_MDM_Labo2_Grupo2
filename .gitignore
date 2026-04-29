@@ -15,3 +15,7 @@
 *.joblib
 
 /work/optuna_artifacts/
+/work/resnet_train/
+/work/resnet_val/
+/work/models/
+*.pth
