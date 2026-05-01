@@ -17,5 +17,7 @@
 /work/optuna_artifacts/
 /work/resnet_train/
 /work/resnet_val/
-/work/models/
-*.pth
+/work/models/*.pth
+
+# Excepción: predicciones del mejor ResNet
+!/work/models/resnet50_val_preds_20260429_203351.joblib
