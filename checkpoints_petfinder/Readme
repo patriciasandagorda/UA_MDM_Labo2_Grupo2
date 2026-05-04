@@ -1,0 +1,6 @@
+Estos archivos son checkpoints del procesado de texto para:
+- Análisis de sentimiento
+- Análisis de emociones
+- Extracción de Embeddings
+
+Se sugiere descargarlos para evitar el re-procesamiento.
