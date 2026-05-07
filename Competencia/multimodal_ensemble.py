@@ -49,7 +49,15 @@ PRICE_COL = "lastSoldPrice_hpi_adjusted"
 N_FOLDS = 5
 RANDOM_STATE = 42
 
+# ── Flags de ejecución ────────────────────────────────────────────────────────
+# Poner en False para cargar predicciones de la corrida anterior (caché).
+# Útil para iterar rápido sobre una sola modalidad sin re-correr las demás.
+RUN_TABULAR = True
+RUN_TEXT    = True
+RUN_IMAGE   = True
+
 print("✅ Imports OK")
+print(f"   Pipelines a ejecutar: Tabular={RUN_TABULAR} | Texto={RUN_TEXT} | Imagen={RUN_IMAGE}")
 
 # %% [markdown]
 # ## 1. Carga de Datos
@@ -199,108 +207,102 @@ X_test = test_fe[FEATURES_TAB]
 print(f"Features tabulares totales: {len(FEATURES_TAB)}")
 
 
-def run_kfold(model_fn, X, y, X_test, n_folds=N_FOLDS, label="Model"):
-    """
-    Entrena con K-Fold, devuelve OOF preds (log) y test preds (log, promediados).
-    """
+# ── run_kfold (se define siempre) ───────────────────────────────────────────
+def run_kfold(model_fn, X, y, X_test, n_folds=N_FOLDS, label="Model", early_stop_rounds=0):
+    """Entrena con K-Fold. Soporta early stopping para LGB/XGB."""
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
-    oof  = np.zeros(len(X))
-    test_preds = np.zeros(len(X_test))
-    scores = []
-
+    oof = np.zeros(len(X)); test_preds = np.zeros(len(X_test)); scores = []
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X)):
         X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
-
         model = model_fn()
-        model.fit(X_tr, y_tr)
-
-        val_pred = model.predict(X_val)
-        oof[val_idx] = val_pred
+        if early_stop_rounds > 0:
+            fp = dict(eval_set=[(X_val, y_val)])
+            mn = type(model).__name__
+            if "LGBM" in mn:
+                fp["callbacks"] = [lgb.early_stopping(early_stop_rounds, verbose=False), lgb.log_evaluation(0)]
+            elif "XGB" in mn:
+                fp["verbose"] = False
+            model.fit(X_tr, y_tr, **fp)
+        else:
+            model.fit(X_tr, y_tr)
+        val_pred = model.predict(X_val); oof[val_idx] = val_pred
         test_preds += model.predict(X_test) / n_folds
-
+        bi = ""
+        if hasattr(model, "best_iteration_"): bi = f"  iters={model.best_iteration_}"
+        elif hasattr(model, "best_iteration"): bi = f"  iters={model.best_iteration}"
         mae = mean_absolute_error(np.expm1(y_val), np.expm1(val_pred))
         mape = mean_absolute_percentage_error(np.expm1(y_val), np.expm1(val_pred))
-        r2  = r2_score(y_val, val_pred)
-        scores.append(mae)
-        print(f"  [{label}] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}  R²={r2:.4f}")
-
+        r2 = r2_score(y_val, val_pred); scores.append(mae)
+        print(f"  [{label}] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}  R²={r2:.4f}{bi}")
     print(f"  [{label}] OOF MAE=${np.mean(scores):,.0f} ± {np.std(scores):,.0f}\n")
     return oof, test_preds
 
 
-# ── LightGBM ────────────────────────────────────────────────────────────────
-print("▶ LightGBM...")
-lgb_cats = [c for c in CAT_FEATURES if c in FEATURES_TAB]
+if RUN_TABULAR:
+    print("▶ LightGBM...")
+    lgb_cats = [c for c in CAT_FEATURES if c in FEATURES_TAB]
+    def lgbm_fn():
+        return lgb.LGBMRegressor(
+            n_estimators=3000, learning_rate=0.01, num_leaves=255,
+            min_child_samples=10, subsample=0.7, colsample_bytree=0.7,
+            reg_alpha=0.05, reg_lambda=0.5, random_state=RANDOM_STATE, verbosity=-1,
+            categorical_feature=lgb_cats)
+    oof_lgb, test_lgb = run_kfold(lgbm_fn, X, y, X_test, label="LightGBM", early_stop_rounds=100)
 
-def lgbm_fn():
-    return lgb.LGBMRegressor(
-        n_estimators=1000, learning_rate=0.03, num_leaves=127,
-        min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.1, reg_lambda=1.0, random_state=RANDOM_STATE, verbosity=-1,
-        categorical_feature=lgb_cats,
-    )
+    print("▶ XGBoost...")
+    X_xgb = X.copy(); X_test_xgb = X_test.copy()
+    for col in CAT_FEATURES:
+        if col in X_xgb.columns:
+            X_xgb[col] = X_xgb[col].cat.codes; X_test_xgb[col] = X_test_xgb[col].cat.codes
+    def xgb_fn():
+        return xgb.XGBRegressor(
+            n_estimators=3000, learning_rate=0.01, max_depth=8,
+            min_child_weight=1, subsample=0.7, colsample_bytree=0.7,
+            reg_alpha=0.05, reg_lambda=0.5, gamma=0.01,
+            random_state=RANDOM_STATE, verbosity=0, tree_method="hist",
+            early_stopping_rounds=100)
+    oof_xgb, test_xgb = run_kfold(xgb_fn, X_xgb, y, X_test_xgb, label="XGBoost", early_stop_rounds=100)
 
-oof_lgb, test_lgb = run_kfold(lgbm_fn, X, y, X_test, label="LightGBM")
+    print("▶ Ridge...")
+    num_cols = [c for c in FEATURES_TAB if c not in CAT_FEATURES]
+    X_ridge = X[num_cols].fillna(0); X_test_ridge = X_test[num_cols].fillna(0)
+    scaler = StandardScaler()
+    X_ridge_sc = scaler.fit_transform(X_ridge); X_test_ridge_sc = scaler.transform(X_test_ridge)
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    oof_ridge = np.zeros(len(X)); test_ridge = np.zeros(len(X_test))
+    for fold, (tri, vli) in enumerate(kf.split(X_ridge_sc)):
+        ridge = Ridge(alpha=10.0); ridge.fit(X_ridge_sc[tri], y.iloc[tri])
+        oof_ridge[vli] = ridge.predict(X_ridge_sc[vli])
+        test_ridge += ridge.predict(X_test_ridge_sc) / N_FOLDS
+        mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_ridge[vli]))
+        mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_ridge[vli]))
+        print(f"  [Ridge] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
+    print(f"  [Ridge] OOF MAE=${mean_absolute_error(np.expm1(y), np.expm1(oof_ridge)):,.0f}  MAPE={mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_ridge)):.2%}\n")
 
-# ── XGBoost ─────────────────────────────────────────────────────────────────
-print("▶ XGBoost...")
-X_xgb      = X.copy()
-X_test_xgb = X_test.copy()
-for col in CAT_FEATURES:
-    if col in X_xgb.columns:
-        X_xgb[col]      = X_xgb[col].cat.codes
-        X_test_xgb[col] = X_test_xgb[col].cat.codes
-
-def xgb_fn():
-    return xgb.XGBRegressor(
-        n_estimators=1000, learning_rate=0.03, max_depth=7,
-        subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.1, reg_lambda=1.0,
-        random_state=RANDOM_STATE, verbosity=0, tree_method="hist",
-    )
-
-oof_xgb, test_xgb = run_kfold(xgb_fn, X_xgb, y, X_test_xgb, label="XGBoost")
-
-# ── Ridge (baseline lineal) ─────────────────────────────────────────────────
-print("▶ Ridge...")
-num_cols = [c for c in FEATURES_TAB if c not in CAT_FEATURES]
-X_ridge      = X[num_cols].fillna(0)
-X_test_ridge = X_test[num_cols].fillna(0)
-scaler = StandardScaler()
-X_ridge_sc      = scaler.fit_transform(X_ridge)
-X_test_ridge_sc = scaler.transform(X_test_ridge)
-
-kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-oof_ridge   = np.zeros(len(X))
-test_ridge  = np.zeros(len(X_test))
-for fold, (tri, vli) in enumerate(kf.split(X_ridge_sc)):
-    ridge = Ridge(alpha=10.0)
-    ridge.fit(X_ridge_sc[tri], y.iloc[tri])
-    oof_ridge[vli]  = ridge.predict(X_ridge_sc[vli])
-    test_ridge     += ridge.predict(X_test_ridge_sc) / N_FOLDS
-    mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_ridge[vli]))
-    mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_ridge[vli]))
-    print(f"  [Ridge] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
-print(f"  [Ridge] OOF MAE=${mean_absolute_error(np.expm1(y), np.expm1(oof_ridge)):,.0f}  MAPE={mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_ridge)):.2%}\n")
-
-print("✅ Pipeline Tabular completo")
-print(f"  LightGBM OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_lgb)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_lgb)):.2%}")
-print(f"  XGBoost  OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_xgb)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_xgb)):.2%}")
-print(f"  Ridge    OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_ridge)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_ridge)):.2%}")
-
+    print("✅ Pipeline Tabular completo")
+    print(f"  LightGBM OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_lgb)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_lgb)):.2%}")
+    print(f"  XGBoost  OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_xgb)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_xgb)):.2%}")
+    print(f"  Ridge    OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_ridge)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_ridge)):.2%}")
+    np.savez(CACHE / "preds_tabular.npz", oof_lgb=oof_lgb, test_lgb=test_lgb,
+             oof_xgb=oof_xgb, test_xgb=test_xgb, oof_ridge=oof_ridge, test_ridge=test_ridge)
+    print("  💾 Predicciones tabulares guardadas en caché")
+else:
+    cached = np.load(CACHE / "preds_tabular.npz")
+    oof_lgb, test_lgb = cached["oof_lgb"], cached["test_lgb"]
+    oof_xgb, test_xgb = cached["oof_xgb"], cached["test_xgb"]
+    oof_ridge, test_ridge = cached["oof_ridge"], cached["test_ridge"]
+    print("📦 Predicciones tabulares cargadas desde caché")
+    print(f"  LightGBM OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_lgb)):,.0f}")
+    print(f"  XGBoost  OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_xgb)):,.0f}")
+    print(f"  Ridge    OOF MAE : ${mean_absolute_error(np.expm1(y), np.expm1(oof_ridge)):,.0f}")
 
 # %% [markdown]
 # ## 4. Pipeline de Texto — DistilBERT (CPU)
 
 # %%
-print("\n" + "="*60)
-print("▶ Pipeline Texto — DistilBERT (CPU)")
-print("="*60)
-
 DISTILBERT_CACHE      = CACHE / "distilbert_train.npy"
 DISTILBERT_TEST_CACHE = CACHE / "distilbert_test.npy"
-
 
 def clean_text(text: str) -> str:
     import re
@@ -310,13 +312,11 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text[:1000]
 
-
 def make_fallback_text(row) -> str:
-    beds  = int(row.get("bedrooms",   0) or 0)
-    baths = int(row.get("bathrooms",  0) or 0)
-    area  = int(row.get("livingArea", 0) or 0)
+    beds = int(row.get("bedrooms", 0) or 0)
+    baths = int(row.get("bathrooms", 0) or 0)
+    area = int(row.get("livingArea", 0) or 0)
     return f"property with {beds} beds and {baths} baths and {area} square feet"
-
 
 def get_distilbert_embeddings(df: pd.DataFrame, cache_path: Path):
     if cache_path.exists():
@@ -328,245 +328,183 @@ def get_distilbert_embeddings(df: pd.DataFrame, cache_path: Path):
     except ImportError:
         print("  ⚠ 'transformers' no instalado. Usando TF-IDF como fallback.")
         return None
-
     tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-    model     = DistilBertModel.from_pretrained("distilbert-base-uncased")
-    model.eval()
-
+    model = DistilBertModel.from_pretrained("distilbert-base-uncased"); model.eval()
     texts = []
     for _, row in df.iterrows():
         desc = clean_text(str(row.get("description", "") or ""))
-        if len(desc.strip()) < 20:
-            desc = make_fallback_text(row)
+        if len(desc.strip()) < 20: desc = make_fallback_text(row)
         texts.append(desc)
-
-    all_embs   = []
-    batch_size = 16
+    all_embs = []; batch_size = 16
     print(f"  Extrayendo embeddings: {len(texts)} textos | batch={batch_size}")
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        enc   = tokenizer(batch, padding=True, truncation=True,
-                          max_length=256, return_tensors="pt")
-        with torch.no_grad():
-            out = model(**enc)
-        cls = out.last_hidden_state[:, 0, :].numpy()
-        all_embs.append(cls)
-        if (i // batch_size) % 20 == 0:
-            print(f"    {i}/{len(texts)}...")
-
-    embs = np.vstack(all_embs)
-    np.save(str(cache_path), embs)
+        enc = tokenizer(batch, padding=True, truncation=True, max_length=256, return_tensors="pt")
+        with torch.no_grad(): out = model(**enc)
+        cls = out.last_hidden_state[:, 0, :].numpy(); all_embs.append(cls)
+        if (i // batch_size) % 20 == 0: print(f"    {i}/{len(texts)}...")
+    embs = np.vstack(all_embs); np.save(str(cache_path), embs)
     print(f"  Guardado: {cache_path.name} | shape={embs.shape}")
     return embs
-
 
 def get_tfidf_embeddings(df_tr, df_te, n_components=64):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.decomposition import TruncatedSVD
     tr_t = df_tr["description"].fillna("").apply(clean_text)
     te_t = df_te["description"].fillna("").apply(clean_text)
-    tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1, 2),
-                            stop_words="english", min_df=3)
-    tr_m = tfidf.fit_transform(tr_t)
-    te_m = tfidf.transform(te_t)
-    svd  = TruncatedSVD(n_components=n_components, random_state=RANDOM_STATE)
-    tr_s = svd.fit_transform(tr_m)
-    te_s = svd.transform(te_m)
+    tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1, 2), stop_words="english", min_df=3)
+    tr_m = tfidf.fit_transform(tr_t); te_m = tfidf.transform(te_t)
+    svd = TruncatedSVD(n_components=n_components, random_state=RANDOM_STATE)
+    tr_s = svd.fit_transform(tr_m); te_s = svd.transform(te_m)
     print(f"  TF-IDF SVD variance: {svd.explained_variance_ratio_.sum():.2%}")
     return tr_s, te_s
 
-
-train_embs_txt = get_distilbert_embeddings(train_fe, DISTILBERT_CACHE)
-test_embs_txt  = get_distilbert_embeddings(test_fe,  DISTILBERT_TEST_CACHE)
-
-N_TXT = 64
-if train_embs_txt is None:
-    print("  Usando TF-IDF + SVD como fallback...")
-    train_embs_txt, test_embs_txt = get_tfidf_embeddings(train_fe, test_fe, n_components=N_TXT)
+if RUN_TEXT:
+    print("\n" + "="*60)
+    print("▶ Pipeline Texto — DistilBERT (CPU)")
+    print("="*60)
+    train_embs_txt = get_distilbert_embeddings(train_fe, DISTILBERT_CACHE)
+    test_embs_txt = get_distilbert_embeddings(test_fe, DISTILBERT_TEST_CACHE)
+    N_TXT = 64
+    if train_embs_txt is None:
+        print("  Usando TF-IDF + SVD como fallback...")
+        train_embs_txt, test_embs_txt = get_tfidf_embeddings(train_fe, test_fe, n_components=N_TXT)
+    else:
+        pca_txt = PCA(n_components=N_TXT, random_state=RANDOM_STATE)
+        train_embs_txt = pca_txt.fit_transform(train_embs_txt)
+        test_embs_txt = pca_txt.transform(test_embs_txt)
+        print(f"  PCA texto: 768 → {N_TXT} | var={pca_txt.explained_variance_ratio_.sum():.2%}")
+    cols_txt = [f"txt_{i}" for i in range(N_TXT)]
+    X_txt = pd.DataFrame(train_embs_txt, columns=cols_txt)
+    X_test_txt = pd.DataFrame(test_embs_txt, columns=cols_txt)
+    sc_txt = StandardScaler()
+    X_txt_sc = sc_txt.fit_transform(X_txt); X_test_txt_sc = sc_txt.transform(X_test_txt)
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    oof_txt = np.zeros(len(X_txt)); test_txt = np.zeros(len(X_test_txt))
+    for fold, (tri, vli) in enumerate(kf.split(X_txt_sc)):
+        r = Ridge(alpha=50.0); r.fit(X_txt_sc[tri], y.iloc[tri])
+        oof_txt[vli] = r.predict(X_txt_sc[vli])
+        test_txt += r.predict(X_test_txt_sc) / N_FOLDS
+        mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_txt[vli]))
+        mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_txt[vli]))
+        print(f"  [Texto-Ridge] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
+    print(f"✅ Texto OOF MAE: ${mean_absolute_error(np.expm1(y), np.expm1(oof_txt)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_txt)):.2%}")
+    np.savez(CACHE / "preds_text.npz", oof_txt=oof_txt, test_txt=test_txt)
+    print("  💾 Predicciones de texto guardadas en caché")
 else:
-    pca_txt        = PCA(n_components=N_TXT, random_state=RANDOM_STATE)
-    train_embs_txt = pca_txt.fit_transform(train_embs_txt)
-    test_embs_txt  = pca_txt.transform(test_embs_txt)
-    print(f"  PCA texto: 768 → {N_TXT} | var={pca_txt.explained_variance_ratio_.sum():.2%}")
-
-cols_txt      = [f"txt_{i}" for i in range(N_TXT)]
-X_txt         = pd.DataFrame(train_embs_txt, columns=cols_txt)
-X_test_txt    = pd.DataFrame(test_embs_txt,  columns=cols_txt)
-sc_txt        = StandardScaler()
-X_txt_sc      = sc_txt.fit_transform(X_txt)
-X_test_txt_sc = sc_txt.transform(X_test_txt)
-
-kf        = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-oof_txt   = np.zeros(len(X_txt))
-test_txt  = np.zeros(len(X_test_txt))
-
-for fold, (tri, vli) in enumerate(kf.split(X_txt_sc)):
-    r = Ridge(alpha=50.0)
-    r.fit(X_txt_sc[tri], y.iloc[tri])
-    oof_txt[vli] = r.predict(X_txt_sc[vli])
-    test_txt    += r.predict(X_test_txt_sc) / N_FOLDS
-    mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_txt[vli]))
-    mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_txt[vli]))
-    print(f"  [Texto-Ridge] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
-
-print(f"✅ Texto OOF MAE: ${mean_absolute_error(np.expm1(y), np.expm1(oof_txt)):,.0f}  MAPE: {mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_txt)):.2%}")
+    cached = np.load(CACHE / "preds_text.npz")
+    oof_txt, test_txt = cached["oof_txt"], cached["test_txt"]
+    print(f"📦 Predicciones de texto cargadas desde caché")
+    print(f"  Texto OOF MAE: ${mean_absolute_error(np.expm1(y), np.expm1(oof_txt)):,.0f}")
 
 # %% [markdown]
 # ## 5. Pipeline de Imágenes — ResNet50 + SVR / XGBoost
 
 # %%
-print("\n" + "="*60)
-print("▶ Pipeline Imágenes — ResNet50 Transfer Learning")
-print("="*60)
-
-IMG_TRAIN_CACHE  = CACHE / "resnet50_train.npy"
-IMG_TEST_CACHE   = CACHE / "resnet50_test.npy"
+IMG_TRAIN_CACHE = CACHE / "resnet50_train.npy"
+IMG_TEST_CACHE = CACHE / "resnet50_test.npy"
 ZPID_TRAIN_CACHE = CACHE / "img_zpid_train.npy"
-ZPID_TEST_CACHE  = CACHE / "img_zpid_test.npy"
+ZPID_TEST_CACHE = CACHE / "img_zpid_test.npy"
 
-
-def extract_resnet_embeddings(meta_df: pd.DataFrame, cache_emb: Path,
-                               cache_zpid: Path, max_imgs: int = 3,
-                               batch_size: int = 64):
+def extract_resnet_embeddings(meta_df, cache_emb, cache_zpid, max_imgs=3, batch_size=64):
     if cache_emb.exists() and cache_zpid.exists():
         print(f"  Cargando desde caché...")
         return np.load(str(cache_emb)), np.load(str(cache_zpid))
     try:
-        import torch
-        import torchvision.models as tvm
-        import torchvision.transforms as T
+        import torch; import torchvision.models as tvm; import torchvision.transforms as T
         from PIL import Image
     except ImportError:
-        print("  ⚠ torch/torchvision no disponible.")
-        return None, None
-
+        print("  ⚠ torch/torchvision no disponible."); return None, None
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {DEVICE}")
-
-    transform = T.Compose([
-        T.Resize(256), T.CenterCrop(224), T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
+    transform = T.Compose([T.Resize(256), T.CenterCrop(224), T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     backbone = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V2)
-    backbone = torch.nn.Sequential(*list(backbone.children())[:-1],
-                                   torch.nn.Flatten())
+    backbone = torch.nn.Sequential(*list(backbone.children())[:-1], torch.nn.Flatten())
     backbone = backbone.to(DEVICE).eval()
-
-    grouped = (meta_df.sort_values("image_index")
-               .groupby("zpid").head(max_imgs))
-    paths  = grouped["image_path"].tolist()
-    zpids  = grouped["zpid"].tolist()
-
+    grouped = meta_df.sort_values("image_index").groupby("zpid").head(max_imgs)
+    paths = grouped["image_path"].tolist(); zpids = grouped["zpid"].tolist()
     all_embs = []
     print(f"  Extrayendo embeddings: {len(paths)} imágenes...")
     for i in range(0, len(paths), batch_size):
         batch_t = []
         for p in paths[i:i + batch_size]:
-            try:
-                img = Image.open(p).convert("RGB")
-                batch_t.append(transform(img))
-            except Exception:
-                batch_t.append(torch.zeros(3, 224, 224))
+            try: img = Image.open(p).convert("RGB"); batch_t.append(transform(img))
+            except Exception: batch_t.append(torch.zeros(3, 224, 224))
         batch_t = torch.stack(batch_t).to(DEVICE)
-        with torch.no_grad():
-            embs = backbone(batch_t).cpu().numpy()
+        with torch.no_grad(): embs = backbone(batch_t).cpu().numpy()
         all_embs.append(embs)
-        if i % (batch_size * 20) == 0:
-            print(f"    {i}/{len(paths)}...")
-
-    embs_arr  = np.vstack(all_embs)
-    zpids_arr = np.array(zpids)
-    np.save(str(cache_emb),  embs_arr)
-    np.save(str(cache_zpid), zpids_arr)
+        if i % (batch_size * 20) == 0: print(f"    {i}/{len(paths)}...")
+    embs_arr = np.vstack(all_embs); zpids_arr = np.array(zpids)
+    np.save(str(cache_emb), embs_arr); np.save(str(cache_zpid), zpids_arr)
     print(f"  Guardado | shape={embs_arr.shape}")
     return embs_arr, zpids_arr
 
-
-def aggregate_by_zpid(embs: np.ndarray, zpids: np.ndarray):
-    df_e = pd.DataFrame(embs)
-    df_e["zpid"] = zpids
+def aggregate_by_zpid(embs, zpids):
+    df_e = pd.DataFrame(embs); df_e["zpid"] = zpids
     agg = df_e.groupby("zpid").mean().reset_index()
     return agg["zpid"].values, agg.drop("zpid", axis=1).values
 
-
-train_meta = pd.read_csv(BASE / "data" / "train_photo_metadata.csv")
-test_meta  = pd.read_csv(BASE / "data" / "test_photo_metadata.csv")
-
-raw_tr_embs, raw_tr_zpids = extract_resnet_embeddings(
-    train_meta, IMG_TRAIN_CACHE, ZPID_TRAIN_CACHE)
-raw_te_embs, raw_te_zpids = extract_resnet_embeddings(
-    test_meta,  IMG_TEST_CACHE,  ZPID_TEST_CACHE)
-
-img_ok = raw_tr_embs is not None
-
-if img_ok:
-    tr_zpids_img, tr_embs_img = aggregate_by_zpid(raw_tr_embs, raw_tr_zpids)
-    te_zpids_img, te_embs_img = aggregate_by_zpid(raw_te_embs, raw_te_zpids)
-
-    N_IMG = 64
-    pca_img = PCA(n_components=N_IMG, random_state=RANDOM_STATE)
-    tr_pca  = pca_img.fit_transform(tr_embs_img)
-    te_pca  = pca_img.transform(te_embs_img)
-    print(f"  PCA imagen: 2048 → {N_IMG} | var={pca_img.explained_variance_ratio_.sum():.2%}")
-
-    tr_pca_map  = dict(zip(tr_zpids_img, tr_pca))
-    te_pca_map  = dict(zip(te_zpids_img, te_pca))
-    median_vec  = np.median(tr_pca, axis=0)
-
-    X_img      = np.array([tr_pca_map.get(z, median_vec) for z in train_fe["zpid"].values])
-    X_test_img = np.array([te_pca_map.get(z, median_vec) for z in test_fe["zpid"].values])
-
-    # Modelo 1: SVR (recomendado para embeddings)
-    print("  ▶ SVR sobre imagen PCA...")
-    sc_img        = StandardScaler()
-    X_img_sc      = sc_img.fit_transform(X_img)
-    X_test_img_sc = sc_img.transform(X_test_img)
-
-    kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    oof_img_svr  = np.zeros(len(X_img))
-    test_img_svr = np.zeros(len(X_test_img))
-
-    for fold, (tri, vli) in enumerate(kf.split(X_img_sc)):
-        svr = SVR(kernel="rbf", C=10.0, epsilon=0.01)
-        svr.fit(X_img_sc[tri], y.iloc[tri])
-        oof_img_svr[vli] = svr.predict(X_img_sc[vli])
-        test_img_svr    += svr.predict(X_test_img_sc) / N_FOLDS
-        mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_img_svr[vli]))
-        mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_img_svr[vli]))
-        print(f"    [Img-SVR] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
-    mae_svr = mean_absolute_error(np.expm1(y), np.expm1(oof_img_svr))
-
-    # Modelo 2: XGBoost
-    print("  ▶ XGBoost sobre imagen PCA...")
-    cols_img      = [f"img_{i}" for i in range(N_IMG)]
-    X_img_df      = pd.DataFrame(X_img,      columns=cols_img)
-    X_test_img_df = pd.DataFrame(X_test_img, columns=cols_img)
-
-    def xgb_img_fn():
-        return xgb.XGBRegressor(
-            n_estimators=500, learning_rate=0.05, max_depth=5,
-            subsample=0.8, colsample_bytree=0.8,
-            random_state=RANDOM_STATE, verbosity=0, tree_method="hist",
-        )
-
-    oof_img_xgb, test_img_xgb = run_kfold(
-        xgb_img_fn, X_img_df, y, X_test_img_df, label="Img-XGB")
-    mae_xgb = mean_absolute_error(np.expm1(y), np.expm1(oof_img_xgb))
-
-    if mae_svr <= mae_xgb:
-        oof_img  = oof_img_svr
-        test_img = test_img_svr
-        print(f"✅ Imagen: SVR ganó (MAE=${mae_svr:,.0f} vs XGB=${mae_xgb:,.0f})")
+if RUN_IMAGE:
+    print("\n" + "="*60)
+    print("▶ Pipeline Imágenes — ResNet50 Transfer Learning")
+    print("="*60)
+    train_meta = pd.read_csv(BASE / "data" / "train_photo_metadata.csv")
+    test_meta = pd.read_csv(BASE / "data" / "test_photo_metadata.csv")
+    raw_tr_embs, raw_tr_zpids = extract_resnet_embeddings(train_meta, IMG_TRAIN_CACHE, ZPID_TRAIN_CACHE)
+    raw_te_embs, raw_te_zpids = extract_resnet_embeddings(test_meta, IMG_TEST_CACHE, ZPID_TEST_CACHE)
+    img_ok = raw_tr_embs is not None
+    if img_ok:
+        tr_zpids_img, tr_embs_img = aggregate_by_zpid(raw_tr_embs, raw_tr_zpids)
+        te_zpids_img, te_embs_img = aggregate_by_zpid(raw_te_embs, raw_te_zpids)
+        N_IMG = 64
+        pca_img = PCA(n_components=N_IMG, random_state=RANDOM_STATE)
+        tr_pca = pca_img.fit_transform(tr_embs_img); te_pca = pca_img.transform(te_embs_img)
+        print(f"  PCA imagen: 2048 → {N_IMG} | var={pca_img.explained_variance_ratio_.sum():.2%}")
+        tr_pca_map = dict(zip(tr_zpids_img, tr_pca))
+        te_pca_map = dict(zip(te_zpids_img, te_pca))
+        median_vec = np.median(tr_pca, axis=0)
+        X_img = np.array([tr_pca_map.get(z, median_vec) for z in train_fe["zpid"].values])
+        X_test_img = np.array([te_pca_map.get(z, median_vec) for z in test_fe["zpid"].values])
+        print("  ▶ SVR sobre imagen PCA...")
+        sc_img = StandardScaler()
+        X_img_sc = sc_img.fit_transform(X_img); X_test_img_sc = sc_img.transform(X_test_img)
+        kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        oof_img_svr = np.zeros(len(X_img)); test_img_svr = np.zeros(len(X_test_img))
+        for fold, (tri, vli) in enumerate(kf.split(X_img_sc)):
+            svr = SVR(kernel="rbf", C=10.0, epsilon=0.01)
+            svr.fit(X_img_sc[tri], y.iloc[tri])
+            oof_img_svr[vli] = svr.predict(X_img_sc[vli])
+            test_img_svr += svr.predict(X_test_img_sc) / N_FOLDS
+            mae = mean_absolute_error(np.expm1(y.iloc[vli]), np.expm1(oof_img_svr[vli]))
+            mape = mean_absolute_percentage_error(np.expm1(y.iloc[vli]), np.expm1(oof_img_svr[vli]))
+            print(f"    [Img-SVR] Fold {fold+1}: MAE=${mae:,.0f}  MAPE={mape:.2%}")
+        mae_svr = mean_absolute_error(np.expm1(y), np.expm1(oof_img_svr))
+        print("  ▶ XGBoost sobre imagen PCA...")
+        cols_img = [f"img_{i}" for i in range(N_IMG)]
+        X_img_df = pd.DataFrame(X_img, columns=cols_img)
+        X_test_img_df = pd.DataFrame(X_test_img, columns=cols_img)
+        def xgb_img_fn():
+            return xgb.XGBRegressor(n_estimators=500, learning_rate=0.05, max_depth=5,
+                subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE, verbosity=0, tree_method="hist")
+        oof_img_xgb, test_img_xgb = run_kfold(xgb_img_fn, X_img_df, y, X_test_img_df, label="Img-XGB")
+        mae_xgb = mean_absolute_error(np.expm1(y), np.expm1(oof_img_xgb))
+        if mae_svr <= mae_xgb:
+            oof_img = oof_img_svr; test_img = test_img_svr
+            print(f"✅ Imagen: SVR ganó (MAE=${mae_svr:,.0f} vs XGB=${mae_xgb:,.0f})")
+        else:
+            oof_img = oof_img_xgb; test_img = test_img_xgb
+            print(f"✅ Imagen: XGBoost ganó (MAE=${mae_xgb:,.0f} vs SVR=${mae_svr:,.0f})")
     else:
-        oof_img  = oof_img_xgb
-        test_img = test_img_xgb
-        print(f"✅ Imagen: XGBoost ganó (MAE=${mae_xgb:,.0f} vs SVR=${mae_svr:,.0f})")
+        print("⚠ Pipeline imagen no disponible — usando predicción tabular como fallback.")
+        oof_img = oof_lgb.copy(); test_img = test_lgb.copy()
+    np.savez(CACHE / "preds_image.npz", oof_img=oof_img, test_img=test_img)
+    print("  💾 Predicciones de imagen guardadas en caché")
 else:
-    print("⚠ Pipeline imagen no disponible — usando predicción tabular como fallback.")
-    oof_img  = oof_lgb.copy()
-    test_img = test_lgb.copy()
-
+    cached = np.load(CACHE / "preds_image.npz")
+    oof_img, test_img = cached["oof_img"], cached["test_img"]
+    print(f"📦 Predicciones de imagen cargadas desde caché")
+    print(f"  Imagen OOF MAE: ${mean_absolute_error(np.expm1(y), np.expm1(oof_img)):,.0f}")
 # %% [markdown]
 # ## 6. Ensamble Final — Ridge Stacking OOF
 
@@ -593,7 +531,11 @@ oof_ensemble  = np.zeros(len(X_oof_sc))
 test_ensemble = np.zeros(len(X_test_sc))
 
 for fold, (tri, vli) in enumerate(kf.split(X_oof_sc)):
-    meta = Ridge(alpha=1.0)
+    meta = xgb.XGBRegressor(
+        n_estimators=300, learning_rate=0.05, max_depth=4,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=RANDOM_STATE, verbosity=0, tree_method="hist"
+    )
     meta.fit(X_oof_sc[tri], y.iloc[tri])
     oof_ensemble[vli] = meta.predict(X_oof_sc[vli])
     test_ensemble    += meta.predict(X_test_sc) / N_FOLDS
@@ -606,10 +548,14 @@ r2_final  = r2_score(y, oof_ensemble)
 mape_final = mean_absolute_percentage_error(np.expm1(y), np.expm1(oof_ensemble))
 print(f"\n✅ Ensemble OOF MAE: ${mae_final:,.0f} | MAPE: {mape_final:.2%} | R²: {r2_final:.4f}")
 
-meta_all = Ridge(alpha=1.0).fit(X_oof_sc, y)
-print("\nPesos del meta-modelo Ridge:")
-for name, coef in zip(stack_names, meta_all.coef_):
-    print(f"  {name:12s}: {coef:+.4f}")
+meta_all = xgb.XGBRegressor(
+    n_estimators=300, learning_rate=0.05, max_depth=4,
+    subsample=0.8, colsample_bytree=0.8,
+    random_state=RANDOM_STATE, verbosity=0, tree_method="hist"
+).fit(X_oof_sc, y)
+print("\nImportancia de variables (meta-modelo XGBoost):")
+for name, imp in zip(stack_names, meta_all.feature_importances_):
+    print(f"  {name:12s}: {imp:.4f}")
 
 # %% [markdown]
 # ## 7. Generación de Submissions
