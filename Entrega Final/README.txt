@@ -1,0 +1,5 @@
+En la carpeta Entrega Final se hace entrega de los siguientes materiales:
+- *petfinder-tabular_vf.ipynb* Notebook final que aplica Feature Engineering, extracción de embeddings de texto e imágenes con PCA, tuneo de hiperparámetros con Optuna, entrenamiento final y conclusiones.
+- *cache* Carpeta que contiene archivos con los resultados de las optimizaciones bayesianas con un objeto de joblib en formato pickle.
+- *checkpoints-petfinder* Carpeta que contiene los embeddings extraídos de imágenes y texto para agilizar la reproducción del script y evitar reprocesamientos.
+- Otros scripts que contienen análisis exploratorios de los datos y prueba de modelos baseline (como RandomForest, CatBoost o SVR), así como la reproducción de los modelos base de Resnet con optimización de hiperparámetros.
